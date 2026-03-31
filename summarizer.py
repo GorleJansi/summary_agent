@@ -15,105 +15,103 @@ from config import (
 
 
 class CircuitLLMError(Exception):
-    """Raised when CIRCUIT token or chat completion fails."""
+    """Raised when Circuit token fetch or chat completion fails."""
 
 
 def _get_display_value(
-    case_data: Dict[str, Any],
-    field_name: str,
+    data: Dict[str, Any],
+    field: str,
     default: str = "Not explicitly mentioned",
 ) -> str:
-    value = case_data.get(field_name)
-
+    value = data.get(field)
     if value is None or value == "":
         return default
-
     if isinstance(value, dict):
-        if value.get("display_value"):
-            return str(value["display_value"])
-        if value.get("value"):
-            return str(value["value"])
-        return default
-
+        return str(value.get("display_value") or value.get("value") or default)
     return str(value)
 
 
 def build_prompt(case_data: Dict[str, Any], timeline: List[Dict[str, Any]]) -> str:
-    case_number = _get_display_value(case_data, "number", "Unknown")
-    case_title = (
+    case_number      = _get_display_value(case_data, "number", "Unknown")
+    short_desc       = (
         _get_display_value(case_data, "case", "")
-        or _get_display_value(case_data, "short_description", "")
-        or "Not explicitly mentioned"
+        or _get_display_value(case_data, "short_description", "Not explicitly mentioned")
     )
-    state = _get_display_value(case_data, "state")
-    description = _get_display_value(case_data, "description")
-
-    priority = _get_display_value(case_data, "priority")
+    state            = _get_display_value(case_data, "state")
+    description      = _get_display_value(case_data, "description")
+    priority         = _get_display_value(case_data, "priority")
     assignment_group = _get_display_value(case_data, "assignment_group")
-    last_updated = _get_display_value(case_data, "sys_updated_on")
+    last_updated     = _get_display_value(case_data, "sys_updated_on")
 
-    lines = []
+    # Split timeline by type so the LLM understands the source of each entry
+    emails, comments, work_notes = [], [], []
     for i, item in enumerate(timeline, start=1):
-        timestamp = item.get("timestamp", "")
-        speaker = item.get("speaker", "unknown")
-        text = item.get("text", "")
-        lines.append(f"{i}. [{timestamp}] {speaker}: {text}")
+        entry = f"{i}. [{item.get('timestamp', '')}] {item.get('speaker', 'unknown')}: {item.get('text', '').strip()}"
+        t = item.get("type", "")
+        if t == "email":
+            emails.append(entry)
+        elif t == "work_note":
+            work_notes.append(entry)
+        else:
+            comments.append(entry)
 
-    timeline_text = "\n".join(lines) if lines else "No journal activity found."
+    def fmt(label: str, items: List[str]) -> str:
+        if not items:
+            return f"[{label}]\nNone.\n"
+        return f"[{label}]\n" + "\n".join(items) + "\n"
 
-    return f"""
-You are a support engineer summarizing ServiceNow cases.
+    timeline_text = (
+        fmt("Customer Emails", emails)
+        + "\n" + fmt("Customer Comments", comments)
+        + "\n" + fmt("Internal Work Notes", work_notes)
+    )
 
-Make the output:
-- Short
-- Clear
-- Informative
-- Useful for engineers
-- Free of unnecessary text
+    return f"""You are a support engineer assistant. Read the ServiceNow case below and write a clear summary.
 
-Rules:
-- Do NOT invent anything
-- Only use explicitly available data from the case fields and timeline
-- Ignore obvious noise like "test", "bad", or unrelated placeholder notes
-- Keep bullets short and specific
-- If a section has no information, write "Not explicitly mentioned"
+The engineer reading this must instantly know:
+- What is the customer's problem?
+- What has already been tried? (so they do not repeat it)
+- Where does the ticket stand right now?
+- What should happen next?
 
-Case Number: {case_number}
-Title: {case_title}
-State: {state}
-Description: {description}
+STRICT RULES:
+- Use ONLY information explicitly present in the case data and timeline below.
+- Do NOT invent, infer, or assume anything not stated. If missing, write: Not explicitly mentioned.
+- Collapse repetition: if the same issue is reported across many emails, say it once and note it was reported repeatedly.
+- Never include email addresses, personal names, or any PII.
+- Short sentences. Bullets only. Be specific.
 
-Case Context:
-- Priority: {priority}
-- Assignment Group: {assignment_group}
-- Last Updated: {last_updated}
+Case Details:
+- Case Number   : {case_number}
+- Title         : {short_desc}
+- Description   : {description}
+- State         : {state}
+- Priority      : {priority}
+- Group         : {assignment_group}
+- Last Updated  : {last_updated}
 
 Timeline:
 {timeline_text}
 
-Return exactly in this format:
+Return EXACTLY this format — no extra sections, no markdown fences:
 
-Problem Summary:
-<1-2 line summary>
+Summary for {case_number}
 
-Customer Impact:
-- <impact or Not explicitly mentioned>
+Issue:
+<1-2 sentences — what is the actual problem the customer is facing?>
 
-Case Context:
-- Priority: {priority}
-- Assignment Group: {assignment_group}
-- Last Updated: {last_updated}
+What happened:
+- <key event, oldest to newest — max 5 bullets, skip repeated noise>
 
-Key Updates:
-- <important update>
-- If none: Not explicitly mentioned
+What was tried:
+- <actions from Internal Work Notes only>
+- (if none: Not explicitly mentioned)
 
-Technical Findings:
-- <explicit technical finding>
-- If none: Not explicitly mentioned
+Current status:
+<1-2 sentences — where does this ticket stand right now?>
 
-Current Status:
-- <explicit status only>
+Next steps:
+- <only if clearly stated in the case — otherwise: Not explicitly mentioned>
 """.strip()
 
 
@@ -121,74 +119,70 @@ def get_access_token() -> str:
     if not CIRCUIT_CLIENT_ID or not CIRCUIT_CLIENT_SECRET:
         raise CircuitLLMError("Missing CIRCUIT_CLIENT_ID or CIRCUIT_CLIENT_SECRET")
 
-    creds = f"{CIRCUIT_CLIENT_ID}:{CIRCUIT_CLIENT_SECRET}"
-    encoded = base64.b64encode(creds.encode("utf-8")).decode("utf-8")
+    encoded = base64.b64encode(
+        f"{CIRCUIT_CLIENT_ID}:{CIRCUIT_CLIENT_SECRET}".encode()
+    ).decode()
 
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": f"Basic {encoded}",
-    }
-    data = {"grant_type": "client_credentials"}
-
-    response = requests.post(
+    resp = requests.post(
         CIRCUIT_TOKEN_URL,
-        headers=headers,
-        data=data,
+        headers={
+            "Content-Type":  "application/x-www-form-urlencoded",
+            "Authorization": f"Basic {encoded}",
+        },
+        data={"grant_type": "client_credentials"},
         timeout=30,
     )
-    response.raise_for_status()
+    resp.raise_for_status()
 
-    payload = response.json()
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise CircuitLLMError(f"Token response missing access_token: {payload}")
-
-    return access_token
+    token = resp.json().get("access_token")
+    if not token:
+        raise CircuitLLMError(f"Token response missing access_token: {resp.json()}")
+    return token
 
 
 def call_circuit_llm(prompt: str) -> str:
     if not CIRCUIT_APP_KEY:
         raise CircuitLLMError("Missing CIRCUIT_APP_KEY")
 
-    access_token = get_access_token()
-    url = f"{CIRCUIT_CHAT_BASE_URL}/{CIRCUIT_MODEL}/chat/completions"
+    token = get_access_token()
+    url   = f"{CIRCUIT_CHAT_BASE_URL}/{CIRCUIT_MODEL}/chat/completions"
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "api-key": access_token,
-    }
-
-    body = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You summarize support cases clearly, briefly, and accurately for engineers. "
-                    "Do not invent or infer missing information."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        "user": json.dumps({"appkey": CIRCUIT_APP_KEY}),
-        "temperature": 0.1,
-    }
-
-    response = requests.post(url, headers=headers, json=body, timeout=60)
-    response.raise_for_status()
-
-    payload = response.json()
+    resp = requests.post(
+        url,
+        headers={
+            "Content-Type":  "application/json",
+            "Accept":        "application/json",
+            "api-key":       token,
+        },
+        json={
+            "messages": [
+                {
+                    "role":    "system",
+                    "content": (
+                        "You summarize ServiceNow support cases for engineers. "
+                        "Be brief, accurate, and never invent information not present in the case."
+                    ),
+                },
+                {
+                    "role":    "user",
+                    "content": prompt,
+                },
+            ],
+            "user":        json.dumps({"appkey": CIRCUIT_APP_KEY}),
+            "temperature": 0.0,
+        },
+        timeout=60,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
 
     choices = payload.get("choices", [])
     if choices:
-        message = choices[0].get("message", {})
-        content = message.get("content")
+        content = choices[0].get("message", {}).get("content")
         if content:
             return content.strip()
 
+    # Fallback response shape
     if isinstance(payload.get("message"), dict):
         content = payload["message"].get("content")
         if content:
@@ -197,6 +191,12 @@ def call_circuit_llm(prompt: str) -> str:
     raise CircuitLLMError(f"Unexpected LLM response format: {payload}")
 
 
-def summarize_case_with_llm(case_data: Dict[str, Any], timeline: List[Dict[str, Any]]) -> str:
-    prompt = build_prompt(case_data, timeline)
-    return call_circuit_llm(prompt)
+def summarize_case_with_llm(
+    case_data: Dict[str, Any],
+    timeline:  List[Dict[str, Any]],
+) -> str:
+    try:
+        return call_circuit_llm(build_prompt(case_data, timeline))
+    except Exception as e:
+        print(f"LLM summarization error: {repr(e)}")
+        return "Summary generation failed. Please try again."

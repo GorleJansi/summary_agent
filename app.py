@@ -1,79 +1,117 @@
-from fastapi import FastAPI, Request
 import re
 import time
-from typing import Dict, Any, Optional
+import threading
+from typing import Any, Dict, Optional
 
 import requests
+from fastapi import FastAPI, Request
 
 from config import WEBEX_BOT_TOKEN, WEBEX_BOT_EMAIL
-from servicenow_client import get_case_by_number, get_case_journal_entries
+from servicenow_client import get_case_by_number, get_case_journal_entries, get_case_emails
 from formatter import build_timeline
 from summarizer import summarize_case_with_llm
 
 app = FastAPI()
 
 WEBEX_API_BASE = "https://webexapis.com/v1"
+BOT_EMAIL_LOWER = (WEBEX_BOT_EMAIL or "").lower()
 
 
-def get_webex_headers() -> Dict[str, str]:
+def is_bot_message(email: str) -> bool:
+    if not email:
+        return False
+    if BOT_EMAIL_LOWER and email == BOT_EMAIL_LOWER:
+        return True
+    if email.endswith(".bot"):
+        return True
+    if "@webex.bot" in email:
+        return True
+    if "bot@webex" in email or "bot@cisco" in email:
+        return True
+    return False
+
+
+def _headers() -> Dict[str, str]:
     return {
         "Authorization": f"Bearer {WEBEX_BOT_TOKEN}",
         "Content-Type": "application/json",
     }
 
 
-def request_with_retry(method: str, url: str, max_retries: int = 3, **kwargs):
-    last_error = None
-
+def _request(method: str, url: str, max_retries: int = 3, **kwargs) -> Optional[requests.Response]:
+    last_exc = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = requests.request(method, url, timeout=30, **kwargs)
-            response.raise_for_status()
-            return response
+            resp = requests.request(method, url, timeout=30, **kwargs)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp
         except requests.exceptions.RequestException as exc:
-            last_error = exc
-            print(f"Request failed ({attempt}/{max_retries}) for {url}: {repr(exc)}")
+            last_exc = exc
+            print(f"[HTTP] attempt {attempt}/{max_retries} failed for {url}: {repr(exc)}")
             if attempt < max_retries:
                 time.sleep(1.5 * attempt)
-
-    raise last_error
-
-
-def extract_case_number(text: str) -> Optional[str]:
-    if not text:
-        return None
-    match = re.search(r"\bCS\d+\b", text.upper())
-    return match.group() if match else None
+    raise last_exc
 
 
-def is_case_number(text: str) -> bool:
-    if not text:
-        return False
-    return bool(re.fullmatch(r"CS\d+", text.strip(), re.IGNORECASE))
+def get_webex_message(message_id: str) -> Optional[Dict[str, Any]]:
+    resp = _request("GET", f"{WEBEX_API_BASE}/messages/{message_id}", headers=_headers())
+    return resp.json() if resp else None
 
 
-def get_webex_message(message_id: str) -> Dict[str, Any]:
-    url = f"{WEBEX_API_BASE}/messages/{message_id}"
-    response = request_with_retry("GET", url, headers=get_webex_headers())
-    return response.json()
+def get_attachment_action(action_id: str) -> Optional[Dict[str, Any]]:
+    resp = _request("GET", f"{WEBEX_API_BASE}/attachment/actions/{action_id}", headers=_headers())
+    return resp.json() if resp else None
 
 
-def get_attachment_action(action_id: str) -> Dict[str, Any]:
-    url = f"{WEBEX_API_BASE}/attachment/actions/{action_id}"
-    response = request_with_retry("GET", url, headers=get_webex_headers())
-    return response.json()
+def send_text(room_id: str, text: str) -> None:
+    _request(
+        "POST",
+        f"{WEBEX_API_BASE}/messages",
+        headers=_headers(),
+        json={"roomId": room_id, "text": text},
+    )
 
 
-def send_webex_message(room_id: str, text: str) -> None:
-    url = f"{WEBEX_API_BASE}/messages"
-    payload = {
-        "roomId": room_id,
-        "text": text,
-    }
-    request_with_retry("POST", url, headers=get_webex_headers(), json=payload)
+def send_card(room_id: str, card_content: Dict[str, Any], fallback_text: str = "Card") -> Optional[str]:
+    resp = _request(
+        "POST",
+        f"{WEBEX_API_BASE}/messages",
+        headers=_headers(),
+        json={
+            "roomId": room_id,
+            "text": fallback_text,
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card_content,
+            }],
+        },
+    )
+    if resp:
+        return resp.json().get("id")
+    return None
 
 
-def build_case_input_card(title: str, subtitle: str) -> Dict[str, Any]:
+def replace_card(message_id: str, card_content: Dict[str, Any], fallback_text: str = "Card") -> None:
+    _request(
+        "PATCH",
+        f"{WEBEX_API_BASE}/messages/{message_id}",
+        headers=_headers(),
+        json={
+            "text": fallback_text,
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card_content,
+            }],
+        },
+    )
+
+
+def _input_card(
+    title: str = "🔍 Support Assistant",
+    subtitle: str = "Enter a ServiceNow case number to generate an AI-powered summary.",
+) -> Dict[str, Any]:
     return {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
@@ -84,119 +122,170 @@ def build_case_input_card(title: str, subtitle: str) -> Dict[str, Any]:
                 "text": title,
                 "weight": "Bolder",
                 "size": "Medium",
+                "color": "Accent",
             },
             {
                 "type": "TextBlock",
                 "text": subtitle,
                 "wrap": True,
                 "spacing": "Small",
+                "color": "Default",
             },
             {
                 "type": "Input.Text",
                 "id": "case_number",
-                "placeholder": "Enter case number, e.g. CS0001051",
+                "placeholder": "e.g. CS0001051",
                 "isRequired": True,
-                "errorMessage": "Please enter a valid case number",
+                "errorMessage": "Please enter a valid case number (e.g. CS0001051)",
             },
         ],
         "actions": [
             {
                 "type": "Action.Submit",
                 "title": "Summarize",
-                "data": {
-                    "action": "summarize_case"
-                },
+                "style": "positive",
+                "data": {"action": "summarize_case"},
             },
             {
                 "type": "Action.Submit",
-                "title": "Exit",
-                "data": {
-                    "action": "exit_menu"
-                },
+                "title": "Cancel",
+                "data": {"action": "exit_menu"},
             },
         ],
     }
 
 
-def send_case_input_card(
-    room_id: str,
-    title: str = "Support Assistant",
-    subtitle: str = "Enter a case number to generate a summary."
-) -> None:
-    url = f"{WEBEX_API_BASE}/messages"
-    payload = {
-        "roomId": room_id,
-        "text": "Support Assistant",
-        "attachments": [
+def _working_card(case_number: str) -> Dict[str, Any]:
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.2",
+        "body": [
             {
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": build_case_input_card(title, subtitle),
-            }
+                "type": "TextBlock",
+                "text": f"⏳ Generating summary for {case_number}…",
+                "wrap": True,
+                "weight": "Bolder",
+                "color": "Accent",
+            },
+            {
+                "type": "TextBlock",
+                "text": "This usually takes a few seconds. The card will update automatically.",
+                "wrap": True,
+            },
         ],
     }
-    request_with_retry("POST", url, headers=get_webex_headers(), json=payload)
+
+
+def _summary_card(case_number: str, summary_text: str) -> Dict[str, Any]:
+    max_chars = 2000
+    body_text = summary_text if len(summary_text) <= max_chars else summary_text[:max_chars] + "…"
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.2",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": f"📋 Summary — {case_number}",
+                "weight": "Bolder",
+                "size": "Medium",
+                "color": "Accent",
+            },
+            {
+                "type": "TextBlock",
+                "text": body_text,
+                "wrap": True,
+                "spacing": "Medium",
+            },
+        ],
+        "actions": [
+            {
+                "type": "Action.Submit",
+                "title": "Summarize another case",
+                "style": "positive",
+                "data": {"action": "open_input_card"},
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Close",
+                "data": {"action": "close_summary"},
+            },
+        ],
+    }
+
+
+def extract_case_number(text: str) -> Optional[str]:
+    if not text:
+        return None
+    match = re.search(r"\bCS\d+\b", text.upper())
+    return match.group() if match else None
+
+
+def is_bare_case_number(text: str) -> bool:
+    return bool(text and re.fullmatch(r"CS\d+", text.strip(), re.IGNORECASE))
 
 
 def get_summary(case_number: str) -> Dict[str, Any]:
     case_record = get_case_by_number(case_number)
-
     if not case_record:
-        return {
-            "case_number": case_number,
-            "summary": "Case not found.",
-        }
+        return {"case_number": case_number, "summary": "❌ Case not found in ServiceNow."}
 
-    case_sys_id = case_record.get("sys_id")
-    if not case_sys_id:
-        return {
-            "case_number": case_number,
-            "summary": "Case record is missing sys_id.",
-        }
+    raw_sys_id = case_record.get("sys_id")
+    if isinstance(raw_sys_id, dict):
+        raw_sys_id = raw_sys_id.get("value") or raw_sys_id.get("display_value")
 
-    journal_entries = get_case_journal_entries(case_sys_id)
-    timeline = build_timeline(journal_entries)
+    if not raw_sys_id:
+        return {"case_number": case_number, "summary": "❌ Case record is missing a sys_id."}
+
+    journal_entries = get_case_journal_entries(raw_sys_id)
+    email_entries = get_case_emails(raw_sys_id)
+    timeline = build_timeline(journal_entries, email_entries)
     llm_summary = summarize_case_with_llm(case_record, timeline)
 
-    return {
-        "case_number": case_number,
-        "summary": llm_summary,
-    }
+    return {"case_number": case_number, "summary": llm_summary}
 
 
-def format_webex_reply(summary_result: Dict[str, Any]) -> str:
-    return (
-        f"Summary for {summary_result.get('case_number', '')}\n\n"
-        f"{summary_result.get('summary', '')}"
-    )
+def format_reply(result: Dict[str, Any]) -> str:
+    case_number = result.get("case_number", "")
+    summary = (result.get("summary") or "").strip()
+
+    if not summary or summary.startswith("❌"):
+        return f"Could not generate summary for {case_number}.\n\n{summary}"
+
+    return summary
 
 
-def parse_action_name(action_details: Dict[str, Any]) -> Optional[str]:
-    inputs = action_details.get("inputs") or {}
-    if isinstance(inputs, dict) and inputs.get("action"):
-        return inputs.get("action")
-
-    data = action_details.get("data") or {}
-    if isinstance(data, dict) and data.get("action"):
-        return data.get("action")
-
+def _parse_action(action_details: Dict[str, Any]) -> Optional[str]:
+    for key in ("inputs", "data"):
+        container = action_details.get(key) or {}
+        if isinstance(container, dict) and container.get("action"):
+            return container["action"]
     return None
 
 
-def parse_case_number_from_action(action_details: Dict[str, Any]) -> Optional[str]:
+def _parse_case_from_action(action_details: Dict[str, Any]) -> Optional[str]:
     inputs = action_details.get("inputs") or {}
     if not isinstance(inputs, dict):
         return None
+    return extract_case_number(inputs.get("case_number", ""))
 
-    case_number = inputs.get("case_number")
-    if not case_number:
-        return None
 
-    return extract_case_number(case_number)
+def _summarize_and_flip(room_id: str, case_number: str, card_message_id: Optional[str]) -> None:
+    result = get_summary(case_number)
+    summary = format_reply(result)
+    sum_card = _summary_card(case_number, summary)
+
+    if card_message_id:
+        replace_card(card_message_id, sum_card, fallback_text=f"Summary — {case_number}")
+    else:
+        send_card(room_id, sum_card, fallback_text=f"Summary — {case_number}")
 
 
 @app.get("/")
 def root():
-    return {"message": "ServiceNow + Webex + CIRCUIT LLM summary bot is running"}
+    return {"message": "ServiceNow + Webex case-summary bot is running ✅"}
 
 
 @app.get("/debug-env")
@@ -211,128 +300,177 @@ def debug_env():
 async def webex_webhook(request: Request):
     try:
         body = await request.json()
-        print("Incoming Webex webhook:", body)
-
         data = body.get("data", {})
         message_id = data.get("id")
         room_id = data.get("roomId")
+        parent_id = data.get("parentId")
         person_email = (data.get("personEmail") or "").lower()
 
         if not message_id or not room_id:
-            return {"status": "ignored", "reason": "Missing message id or room id"}
+            return {"status": "ignored", "reason": "Missing message_id or room_id"}
 
-        if WEBEX_BOT_EMAIL and person_email == WEBEX_BOT_EMAIL.lower():
-            return {"status": "ignored", "reason": "Bot webhook event"}
+        if is_bot_message(person_email):
+            return {"status": "ignored", "reason": "Bot event (outer payload)"}
+
+        if parent_id:
+            return {"status": "ignored", "reason": "Thread reply (parentId present)"}
 
         message = get_webex_message(message_id)
+        if not message:
+            return {"status": "ignored", "reason": "Message not found (404 or fetch error)"}
+
         fetched_email = (message.get("personEmail") or "").lower()
         text = (message.get("text") or "").strip()
 
-        print("Fetched Webex text:", text)
+        if is_bot_message(fetched_email):
+            return {"status": "ignored", "reason": "Bot event (fetched message)"}
 
-        if WEBEX_BOT_EMAIL and fetched_email == WEBEX_BOT_EMAIL.lower():
-            return {"status": "ignored", "reason": "Fetched bot message"}
+        if re.search(r"Summary for CS\d+", text, re.IGNORECASE):
+            return {"status": "ignored", "reason": "Bot summary echo"}
 
-        if text.startswith("Summary for CS"):
-            return {"status": "ignored", "reason": "Bot summary message"}
+        bot_fallback_phrases = {
+            "support assistant",
+            "support assistant – enter a case number to summarize",
+            "generating summary…",
+            "generating summary...",
+            "summary closed",
+            "summarize another case?",
+            "summary —",
+        }
+        if text.lower() in bot_fallback_phrases:
+            return {"status": "ignored", "reason": "Bot card fallback text echo"}
 
-        if text.lower() in {"exit", "quit", "close"}:
-            send_webex_message(
-                room_id,
-                "Okay — closed the flow. Message me anytime or enter a case number when you need another summary."
-            )
-            return {"status": "ok", "reason": "Exited"}
+        text_lower = text.lower()
 
-        if is_case_number(text):
+        if text_lower in {"exit", "quit", "close"}:
+            send_text(room_id, "Closed ✅ Message me anytime or enter a case number to start a new summary.")
+            return {"status": "ok", "reason": "Exited via text command"}
+
+        if is_bare_case_number(text):
             case_number = text.strip().upper()
-            summary_result = get_summary(case_number)
-            send_webex_message(room_id, format_webex_reply(summary_result))
-            send_case_input_card(
-                room_id,
-                title="Summarize another case",
-                subtitle="Enter the next case number below."
-            )
+            card_id = send_card(room_id, _working_card(case_number), fallback_text="Generating summary…")
+            threading.Thread(
+                target=_summarize_and_flip,
+                args=(room_id, case_number, card_id),
+                daemon=True,
+            ).start()
             return {"status": "ok", "case_number": case_number}
 
-        direct_case_number = extract_case_number(text)
-        if direct_case_number and text.lower().startswith("summarize"):
-            summary_result = get_summary(direct_case_number)
-            send_webex_message(room_id, format_webex_reply(summary_result))
-            send_case_input_card(
-                room_id,
-                title="Summarize another case",
-                subtitle="Enter the next case number below."
-            )
-            return {"status": "ok", "case_number": direct_case_number}
+        if text_lower.startswith("summarize"):
+            direct_case = extract_case_number(text)
+            if direct_case:
+                card_id = send_card(room_id, _working_card(direct_case), fallback_text="Generating summary…")
+                threading.Thread(
+                    target=_summarize_and_flip,
+                    args=(room_id, direct_case, card_id),
+                    daemon=True,
+                ).start()
+                return {"status": "ok", "case_number": direct_case}
 
-        # default: show input card on first/fallback interaction
-        send_case_input_card(
+        send_card(
             room_id,
-            title="Support Assistant",
-            subtitle="Enter a case number to generate a summary."
+            _input_card(),
+            fallback_text="Support Assistant – enter a case number to summarize",
         )
         return {"status": "ok", "reason": "Input card shown"}
 
-    except Exception as e:
-        print("Webhook processing error:", repr(e))
-        return {"status": "error", "detail": str(e)}
+    except Exception as exc:
+        print(f"[webhook/webex] Error: {repr(exc)}")
+        return {"status": "error", "detail": str(exc)}
 
 
 @app.post("/webhook/webex/card-action")
 async def webex_card_action_webhook(request: Request):
     try:
         body = await request.json()
-        print("Incoming Webex card action webhook:", body)
-
         data = body.get("data", {})
         action_id = data.get("id")
         room_id = data.get("roomId")
         person_email = (data.get("personEmail") or "").lower()
+        card_message_id = data.get("messageId")
 
         if not action_id or not room_id:
-            return {"status": "ignored", "reason": "Missing action id or room id"}
+            return {"status": "ignored", "reason": "Missing action_id or room_id"}
 
-        if WEBEX_BOT_EMAIL and person_email == WEBEX_BOT_EMAIL.lower():
+        if is_bot_message(person_email):
             return {"status": "ignored", "reason": "Bot action event"}
 
         action_details = get_attachment_action(action_id)
-        print("Card action details:", action_details)
+        if not action_details:
+            return {"status": "ignored", "reason": "Could not fetch action details (404?)"}
 
-        action_name = parse_action_name(action_details)
+        action_name = _parse_action(action_details)
+
+        if action_name == "open_input_card":
+            if card_message_id:
+                replace_card(
+                    card_message_id,
+                    _input_card(),
+                    fallback_text="Support Assistant",
+                )
+            else:
+                send_card(
+                    room_id,
+                    _input_card(),
+                    fallback_text="Support Assistant",
+                )
+            return {"status": "ok", "reason": "Input card shown (open_input_card)"}
 
         if action_name == "exit_menu":
-            send_webex_message(
-                room_id,
-                "Okay — closed the flow. Enter a case number anytime if you want a summary."
-            )
-            return {"status": "ok", "reason": "Exited"}
+            send_text(room_id, "Closed ✅ Enter a case number anytime to generate a new summary.")
+            return {"status": "ok", "reason": "Exited (exit_menu)"}
+
+        if action_name == "close_summary":
+            if card_message_id:
+                replace_card(
+                    card_message_id,
+                    _input_card(),
+                    fallback_text="Support Assistant",
+                )
+            else:
+                send_card(
+                    room_id,
+                    _input_card(),
+                    fallback_text="Support Assistant",
+                )
+            return {"status": "ok", "reason": "Returned to input card"}
 
         if action_name == "summarize_case":
-            case_number = parse_case_number_from_action(action_details)
+            case_number = _parse_case_from_action(action_details)
 
             if not case_number:
-                send_webex_message(
-                    room_id,
-                    "I couldn't find a valid case number in the card input. Please enter something like CS0001051."
-                )
-                send_case_input_card(
-                    room_id,
-                    title="Try again",
-                    subtitle="Enter a valid case number to generate a summary."
-                )
-                return {"status": "ok", "reason": "Invalid card input"}
+                if card_message_id:
+                    replace_card(
+                        card_message_id,
+                        _input_card(
+                            title="⚠️ Invalid case number",
+                            subtitle="Please enter a valid case number like CS0001051.",
+                        ),
+                        fallback_text="Invalid case number – try again",
+                    )
+                else:
+                    send_card(
+                        room_id,
+                        _input_card(
+                            title="⚠️ Invalid case number",
+                            subtitle="Please enter a valid case number like CS0001051.",
+                        ),
+                        fallback_text="Invalid case number – try again",
+                    )
+                return {"status": "ok", "reason": "Invalid case number"}
 
-            summary_result = get_summary(case_number)
-            send_webex_message(room_id, format_webex_reply(summary_result))
-            send_case_input_card(
-                room_id,
-                title="Summarize another case",
-                subtitle="Enter the next case number below."
-            )
+            if card_message_id:
+                replace_card(card_message_id, _working_card(case_number), fallback_text="Generating summary…")
+
+            threading.Thread(
+                target=_summarize_and_flip,
+                args=(room_id, case_number, card_message_id),
+                daemon=True,
+            ).start()
             return {"status": "ok", "case_number": case_number}
 
-        return {"status": "ignored", "reason": f"Unknown card action: {action_name}"}
+        return {"status": "ignored", "reason": f"Unknown action: {action_name}"}
 
-    except Exception as e:
-        print("Card action processing error:", repr(e))
-        return {"status": "error", "detail": str(e)}
+    except Exception as exc:
+        print(f"[webhook/webex/card-action] Error: {repr(exc)}")
+        return {"status": "error", "detail": str(exc)}
