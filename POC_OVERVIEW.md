@@ -4,7 +4,7 @@
 
 This POC demonstrates an AI-powered support assistant that automatically summarizes ServiceNow customer service cases and delivers the summary directly inside a Webex conversation.
 
-Support engineers currently spend significant time manually reading through case histories, customer comments, and internal work notes to understand the current situation. This bot eliminates that overhead — an engineer simply types a case number in Webex and receives a structured, AI-generated summary in seconds.
+Support engineers currently spend significant time manually reading through case histories, customer comments, internal work notes, and case emails to understand the current situation. This bot eliminates that overhead — an engineer simply types a case number in Webex and receives a structured, AI-generated summary in seconds.
 
 ---
 
@@ -25,12 +25,12 @@ An intelligent Webex Bot that:
 
 1. Listens for messages in a Webex space
 2. Accepts a ServiceNow case number (e.g. `CS0001051`)
-3. Fetches the full case record and journal history from ServiceNow
-4. Builds a structured timeline of all customer comments and engineer work notes
+3. Fetches the full case record, journal history, and case emails from ServiceNow
+4. Builds a unified, chronologically sorted timeline of customer comments, engineer work notes, and emails
 5. Sends the timeline to Cisco's internal Circuit LLM (AI model)
-6. Returns a clean, structured summary back to the Webex space
+6. Returns a clean, structured summary back to the Webex space as an interactive Adaptive Card
 
-The engineer never leaves Webex. The entire interaction takes 3–5 seconds.
+The engineer never leaves Webex. The entire interaction takes 3–5 seconds. The card updates in-place — a "working" spinner card flips to the summary automatically using a background thread.
 
 ---
 
@@ -39,8 +39,8 @@ The engineer never leaves Webex. The entire interaction takes 3–5 seconds.
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                        WEBEX SPACE                          │
-│  Engineer types: "CS0001051"                                │
-│  Bot replies with AI summary                                │
+│  Engineer types: "CS0001051"  (or uses input card)          │
+│  Bot shows ⏳ working card → flips to 📋 summary card       │
 └────────────────────┬────────────────────────────────────────┘
                      │  Webex Webhook (HTTPS POST)
                      ▼
@@ -48,39 +48,48 @@ The engineer never leaves Webex. The entire interaction takes 3–5 seconds.
 │                   FASTAPI APPLICATION                        │
 │                    (app.py — port 8000)                     │
 │                                                             │
-│  POST /webhook/webex       ← Receives Webex messages        │
-│  POST /webhook/webex/card-action ← Handles card submissions │
-│  GET  /health              ← Health check                   │
-│  GET  /debug-env           ← Env var verification           │
+│  POST /webhook/webex            ← Receives Webex messages   │
+│  POST /webhook/webex/card-action← Handles card submissions  │
+│  GET  /                         ← Bot running status        │
+│  GET  /debug-env                ← Env var verification      │
 └──────┬──────────────────────────────────────┬───────────────┘
        │                                      │
        ▼                                      ▼
-┌──────────────────┐              ┌───────────────────────────┐
-│  SERVICENOW API  │              │    CISCO CIRCUIT LLM      │
-│                  │              │                           │
-│ Fetch case by    │              │ Step 1: OAuth2 token      │
-│ case number      │              │  → id.cisco.com           │
-│                  │              │                           │
-│ Fetch journal    │              │ Step 2: Chat completion   │
-│ entries          │              │  → chat-ai.cisco.com      │
-│ (comments +      │              │  Model: gpt-4o-mini       │
-│  work notes)     │              └───────────────────────────┘
-└──────────────────┘
+┌──────────────────────────┐    ┌─────────────────────────────┐
+│     SERVICENOW API       │    │      CISCO CIRCUIT LLM      │
+│                          │    │                             │
+│  sn_customerservice_case │    │  Step 1: OAuth2 token       │
+│  → case record + sys_id  │    │   → id.cisco.com            │
+│                          │    │                             │
+│  sys_journal_field       │    │  Step 2: Chat completion    │
+│  → comments + work_notes │    │   → chat-ai.cisco.com       │
+│                          │    │   Model: gpt-4o-mini        │
+│  sys_email               │    │   Temp: 0.0 (deterministic) │
+│  → case emails           │    └─────────────────────────────┘
+└──────────────────────────┘
        │
        ▼
-┌──────────────────────────────┐
-│  FORMATTER (formatter.py)    │
-│  Builds structured timeline  │
-│  from raw journal entries    │
-└──────────────────────────────┘
+┌──────────────────────────────────┐
+│  FORMATTER (formatter.py)        │
+│  Merges + sorts all entries into │
+│  a unified chronological timeline│
+│  (emails, comments, work notes)  │
+└──────────────────────────────────┘
        │
        ▼
-┌──────────────────────────────┐
-│  SUMMARIZER (summarizer.py)  │
-│  Builds AI prompt            │
-│  Calls Circuit LLM           │
-│  Returns structured summary  │
-└──────────────────────────────┘
+┌──────────────────────────────────┐
+│  SUMMARIZER (summarizer.py)      │
+│  Builds structured AI prompt     │
+│  Calls Circuit LLM               │
+│  Returns fixed-format summary    │
+└──────────────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────┐
+│  CARD FLIP (background thread)   │
+│  PATCH /messages/{id}            │
+│  Replaces ⏳ card with 📋 summary│
+└──────────────────────────────────┘
 ```
 
 ---
@@ -89,13 +98,13 @@ The engineer never leaves Webex. The entire interaction takes 3–5 seconds.
 
 ```
 summary-agent/
-├── app.py                  # Main FastAPI application — all routes & webhook logic
+├── app.py                  # Main FastAPI app — routes, webhook logic, card management
 ├── config.py               # Loads all environment variables from .env
-├── formatter.py            # Converts raw journal entries into structured timeline
-├── servicenow_client.py    # ServiceNow REST API integration
-├── summarizer.py           # Circuit LLM integration — prompt + AI call
+├── formatter.py            # Merges journal entries + emails into sorted timeline
+├── servicenow_client.py    # ServiceNow REST API — case, journal, email fetching
+├── summarizer.py           # Circuit LLM OAuth2 + prompt builder + AI call
 ├── requirements.txt        # Python package dependencies
-└── .env                    # Configuration & secrets (not shared)
+└── .env                    # Configuration & secrets (gitignored, not committed)
 ```
 
 ---
@@ -105,178 +114,206 @@ summary-agent/
 ### Layer 1 — Configuration (`config.py`)
 
 **What it does:**
-Loads all secrets and configuration values from the `.env` file into Python variables at startup.
+Loads all secrets and configuration values from the `.env` file into Python variables at startup using `python-dotenv`.
 
 **Key variables:**
 
 | Variable | Purpose |
 |----------|---------|
-| `SERVICENOW_INSTANCE` | ServiceNow hostname |
+| `SERVICENOW_INSTANCE` | ServiceNow hostname (e.g. `dev12345.service-now.com`) |
 | `SERVICENOW_USERNAME` | ServiceNow API credentials |
 | `SERVICENOW_PASSWORD` | ServiceNow API credentials |
-| `WEBEX_BOT_TOKEN` | Webex Bot API token |
-| `WEBEX_BOT_EMAIL` | Bot's own email (to ignore its own messages) |
+| `WEBEX_BOT_TOKEN` | Webex Bot API bearer token |
+| `WEBEX_BOT_EMAIL` | Bot's own email — used to prevent self-message loops |
 | `CIRCUIT_CLIENT_ID` | Cisco Circuit LLM OAuth2 client ID |
 | `CIRCUIT_CLIENT_SECRET` | Cisco Circuit LLM OAuth2 secret |
 | `CIRCUIT_APP_KEY` | Cisco Circuit LLM app registration key |
-| `CIRCUIT_MODEL` | LLM model name (`gpt-4o-mini`) |
-| `CIRCUIT_TOKEN_URL` | OAuth2 token endpoint |
-| `CIRCUIT_CHAT_BASE_URL` | Circuit LLM chat completions base URL |
-
-**Why separate?** Keeps all secrets in one place, makes the app portable, and avoids hardcoding credentials.
+| `CIRCUIT_MODEL` | LLM model name (default: `gpt-4o-mini`) |
+| `CIRCUIT_TOKEN_URL` | OAuth2 token endpoint (default: `https://id.cisco.com/oauth2/default/v1/token`) |
+| `CIRCUIT_CHAT_BASE_URL` | Circuit LLM base URL (default: `https://chat-ai.cisco.com/openai/deployments`) |
 
 ---
 
 ### Layer 2 — ServiceNow Client (`servicenow_client.py`)
 
 **What it does:**
-Makes authenticated REST API calls to ServiceNow to retrieve case data.
+Makes authenticated REST API calls to ServiceNow to retrieve case data, journal entries, and case emails.
 
 **Functions:**
 
 `get_case_by_number(case_number)`
-- Calls ServiceNow Table API: `GET /api/now/table/sn_customerservice_case`
-- Fetches: `sys_id`, `number`, `short_description`, `description`, `state`, timestamps
-- Returns the case record as a Python dictionary
+- Calls: `GET /api/now/table/sn_customerservice_case`
+- Fetches: `sys_id`, `number`, `case`, `short_description`, `description`, `state`, `priority`, `severity`, `assignment_group`, `assigned_to`, timestamps
+- Uses `sysparm_display_value=all` to get human-readable values alongside raw values
+- Returns the first matching case record as a Python dict, or `None`
 
 `get_case_journal_entries(sys_id)`
-- Calls ServiceNow Table API: `GET /api/now/table/sys_journal_field`
-- Fetches all `comments` (customer-visible) and `work_notes` (internal engineer notes)
-- Ordered by creation date (chronological)
-- Falls back to `documentkey` query if primary query returns empty
+- Calls: `GET /api/now/table/sys_journal_field`
+- Fetches all `comments` (customer-visible) and `work_notes` (internal engineer notes) ordered chronologically
+- **Fallback:** if the primary `element_id` query returns empty, retries using `documentkey` (handles different ServiceNow instance configurations)
 
-**Authentication:** HTTP Basic Auth (username + password)
+`get_case_emails(sys_id)`
+- Calls: `GET /api/now/table/sys_email`
+- Fetches emails linked to the case, filtered by `instance={sys_id}` and `target_table=sn_customerservice_case` to avoid pulling unrelated emails
+- Returns: `sys_id`, `sys_created_on`, `type`, `subject`, `body`, `body_text`, `recipients`
+
+**Authentication:** HTTP Basic Auth over HTTPS
 
 ---
 
 ### Layer 3 — Formatter (`formatter.py`)
 
 **What it does:**
-Transforms raw ServiceNow journal entry data into a clean, structured timeline suitable for the AI model.
+Transforms raw ServiceNow data (journal entries + emails) into a clean, unified, chronologically sorted timeline ready for the AI prompt.
 
 **Functions:**
 
 | Function | Purpose |
 |----------|---------|
-| `clean_text(text)` | Strips newlines, extra whitespace from entry text |
-| `to_iso(ts)` | Converts ServiceNow timestamp format to ISO 8601 |
-| `map_speaker(element)` | Maps `comments` → `customer`, `work_notes` → `support_engineer` |
-| `map_type(element)` | Maps element to `comment` or `work_note` |
-| `build_timeline(journal_entries)` | Produces a list of structured timeline dicts |
+| `clean_text(text)` | Strips newlines, collapses extra whitespace |
+| `to_iso(ts)` | Converts ServiceNow `YYYY-MM-DD HH:MM:SS` to ISO 8601 (`Z` suffix) |
+| `map_speaker(element)` | Maps `comments` → `customer`, `work_notes` → `support_engineer`, `email` → `customer` |
+| `map_type(element)` | Maps element to `comment`, `work_note`, or `email` |
+| `build_timeline(journal_entries, email_entries)` | Merges both sources, sorts by timestamp ascending |
 
 **Output format per timeline entry:**
 ```python
 {
-  "type": "comment",
-  "speaker": "customer",
+  "type":      "work_note",
+  "source":    "work_notes",
+  "speaker":   "support_engineer",
   "timestamp": "2026-03-29T02:05:25Z",
-  "text": "WhatsApp messages not delivered since yesterday"
+  "text":      "Checked logs — missing dependency confirmed"
 }
 ```
+
+The merged, sorted timeline means the LLM sees all events in true chronological order regardless of source.
 
 ---
 
 ### Layer 4 — Summarizer (`summarizer.py`)
 
 **What it does:**
-Builds the AI prompt from case data and timeline, authenticates with Cisco Circuit LLM via OAuth2, calls the LLM API, and returns the structured summary.
+Builds the AI prompt from case data + timeline, authenticates with Cisco Circuit LLM via OAuth2, calls the LLM, and returns the structured summary string.
+
+**Custom exception:** `CircuitLLMError` — raised when token fetch or chat completion fails, so the caller can handle it gracefully.
 
 **Functions:**
 
-`_get_display_value(case_data, field_name)`
-- Safely extracts a field value from the ServiceNow case record
-- Handles nested dict format (ServiceNow returns `{"display_value": "...", "value": "..."}`)
+`_get_display_value(data, field, default)`
+- Safely extracts a field from the ServiceNow case record
+- Handles nested dict format (`{"display_value": "...", "value": "..."}`)
+- Returns `default` (`"Not explicitly mentioned"`) if field is missing or empty
 
 `build_prompt(case_data, timeline)`
-- Constructs a detailed, instruction-guided prompt for the LLM
-- Includes: case number, title, state, description, priority, assignment group, full timeline
-- Instructs the LLM to return output in a fixed structured format:
-  - Problem Summary
-  - Customer Impact
-  - Case Context
-  - Key Updates
-  - Technical Findings
-  - Current Status
+- Constructs a detailed, instruction-guided prompt
+- Splits timeline into three labelled sections: **Customer Emails**, **Customer Comments**, **Internal Work Notes**
+- Each timeline entry is numbered and formatted as: `N. [timestamp] speaker: text`
+- Strict rules injected: no PII, no invention, collapse repetition, max 5 key-event bullets
+- Returns output in a **fixed format** (no markdown fences):
+  ```
+  Summary for CS...
+  Issue:
+  What happened:
+  What was tried:
+  Current status:
+  Next steps:
+  ```
 
 `get_access_token()`
-- Authenticates with Cisco's OAuth2 server: `https://id.cisco.com/oauth2/default/v1/token`
-- Uses `client_credentials` grant type
-- Encodes `client_id:client_secret` as Base64 for HTTP Basic Auth header
-- Returns a Bearer access token
+- POSTs to `CIRCUIT_TOKEN_URL` with `grant_type=client_credentials`
+- Encodes `client_id:client_secret` as Base64 for HTTP Basic Auth
+- Returns a short-lived Bearer access token
+- Raises `CircuitLLMError` if credentials are missing or token is absent from response
 
 `call_circuit_llm(prompt)`
-- Calls: `https://chat-ai.cisco.com/openai/deployments/gpt-4o-mini/chat/completions`
-- Sends the system role + user prompt
-- Passes `CIRCUIT_APP_KEY` in the `user` field as a JSON-encoded string
-- Parses and returns the LLM's response content
+- Calls: `{CIRCUIT_CHAT_BASE_URL}/{CIRCUIT_MODEL}/chat/completions`
+- Uses `api-key` header (not `Authorization: Bearer`) — Circuit LLM specific
+- Passes `CIRCUIT_APP_KEY` as `json.dumps({"appkey": ...})` in the `user` field
+- Sets `temperature: 0.0` for deterministic, repeatable summaries
+- Handles both standard `choices[0].message.content` and fallback response shapes
 
 `summarize_case_with_llm(case_data, timeline)`
-- Orchestrator: calls `build_prompt()` → calls `call_circuit_llm()` → returns summary string
+- Orchestrator: `build_prompt()` → `call_circuit_llm()` → returns summary string
+- On any exception: logs the error and returns `"Summary generation failed. Please try again."`
 
 ---
 
 ### Layer 5 — Application (`app.py`)
 
 **What it does:**
-The main FastAPI application. Handles all incoming HTTP requests from Webex, orchestrates the full summarization flow, and sends responses back to Webex.
+The main FastAPI application. Handles all Webex webhook events, manages Adaptive Card lifecycle (send → working → summary → flip), orchestrates the full summarization pipeline, and prevents bot message loops.
+
+**Bot Loop Prevention — `is_bot_message(email)`**
+
+Defined at module level using `BOT_EMAIL_LOWER = (WEBEX_BOT_EMAIL or "").lower()`. Catches bot messages via four checks:
+1. Exact match against `BOT_EMAIL_LOWER` (env var match)
+2. Email ends with `.bot` (e.g. `jansi-test@webex.bot`)
+3. Contains `@webex.bot`
+4. Contains `bot@webex` or `bot@cisco`
+
+This is robust even if the env var is wrong or missing.
 
 **API Endpoints:**
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/` | GET | Returns bot running status |
-| `/health` | GET | Health check — confirms server is up |
-| `/debug-env` | GET | Confirms environment variables are loaded |
+| `/` | GET | Returns bot running status message |
+| `/debug-env` | GET | Shows whether `WEBEX_BOT_TOKEN` is set and the value of `WEBEX_BOT_EMAIL` |
 | `/webhook/webex` | POST | Receives all Webex message events |
-| `/webhook/webex/card-action` | POST | Receives Webex Adaptive Card form submissions |
+| `/webhook/webex/card-action` | POST | Receives Webex Adaptive Card button submissions |
 
-**Key Functions:**
+**HTTP Helper — `_request(method, url, max_retries=3)`**
+- Wraps all outbound HTTP calls
+- 3 attempts with exponential backoff (1.5s × attempt)
+- Returns `None` on 404 (rather than raising) — prevents crashes on deleted messages
+- Raises on all other errors after retries exhausted
 
-`request_with_retry(method, url, max_retries=3)`
-- Wraps all outbound HTTP calls with automatic retry logic (3 attempts, exponential backoff)
-- Ensures reliability against transient network errors
+**Card Helpers:**
 
-`extract_case_number(text)`
-- Uses regex `\bCS\d+\b` to find a ServiceNow case number anywhere in a message
+| Function | Purpose |
+|----------|---------|
+| `send_card(room_id, card, fallback_text)` | Sends a new card message, returns `message_id` |
+| `replace_card(message_id, card, fallback_text)` | PATCHes an existing card in-place |
+| `send_text(room_id, text)` | Sends a plain text message |
+| `_input_card(title, subtitle)` | Builds the input form card (text field + Summarize + Cancel) |
+| `_working_card(case_number)` | Builds the ⏳ spinner card shown while LLM processes |
+| `_summary_card(case_number, summary_text)` | Builds the 📋 result card (truncated to 2000 chars) with "Summarize another" + "Close" buttons |
 
-`is_case_number(text)`
-- Checks if the entire message is just a case number (e.g. user typed only `CS0001051`)
-
-`build_case_input_card()`
-- Builds an **Adaptive Card** — an interactive form inside Webex with:
-  - Text input for case number
-  - "Summarize" button
-  - "Exit" button
-
-`send_case_input_card(room_id)`
-- Sends the Adaptive Card to the Webex room so users can submit a case number via form
-
-`get_summary(case_number)`
-- Full orchestration pipeline:
-  1. Fetch case from ServiceNow
-  2. Fetch journal entries
-  3. Build timeline
-  4. Call LLM for summary
-  5. Return structured result
+**Background Thread — `_summarize_and_flip(room_id, case_number, card_message_id)`**
+- Runs the full `get_summary()` pipeline in a daemon thread so the webhook returns `200 OK` immediately
+- When summary is ready, calls `replace_card()` to PATCH the ⏳ working card with the 📋 summary card
+- If no `card_message_id` (edge case), sends a new card instead
 
 **Webhook Message Flow (`/webhook/webex`):**
 
 ```
-1. Receive Webex event → extract message_id + room_id
-2. Ignore bot's own messages (prevent loop)
-3. Ignore "exit/quit/close" → send goodbye message
-4. If message is exactly a case number → generate summary + show next card
-5. If message contains "summarize CS..." → generate summary + show next card
-6. Otherwise → show input card (guide user)
+1. Receive Webex event → extract message_id, room_id, parentId, person_email
+2. Ignore if missing message_id or room_id
+3. Ignore if is_bot_message(person_email) — outer payload check
+4. Ignore if parentId present — thread replies are skipped
+5. Fetch full message from Webex API
+6. Ignore if is_bot_message(fetched_email) — fetched message check
+7. Ignore if text matches "Summary for CS..." — bot summary echo guard
+8. Ignore if text is a known bot card fallback phrase
+9. If "exit/quit/close" → send goodbye text
+10. If text is exactly a case number → send ⏳ card → start background thread
+11. If text starts with "summarize" + has case number → send ⏳ card → start background thread
+12. Otherwise → show 🔍 input card
 ```
 
 **Card Action Flow (`/webhook/webex/card-action`):**
 
 ```
-1. Receive card submission event → fetch action details
-2. If action = "exit_menu" → send goodbye message
-3. If action = "summarize_case" → extract case number → generate summary → show next card
-4. If case number invalid → show error + retry card
+1. Receive card submission → extract action_id, room_id, person_email, card_message_id
+2. Ignore if is_bot_message(person_email)
+3. Fetch action details from Webex API
+4. action = "open_input_card" → replace/send input card
+5. action = "exit_menu"       → send goodbye text
+6. action = "close_summary"   → replace/send input card
+7. action = "summarize_case"  → validate case number
+   → valid:   replace card with ⏳ working card → start background thread
+   → invalid: replace/send input card with error subtitle
 ```
 
 ---
@@ -286,17 +323,18 @@ The main FastAPI application. Handles all incoming HTTP requests from Webex, orc
 | Technology | Category | Why Used |
 |-----------|----------|----------|
 | **Python 3.13** | Language | Core development language |
-| **FastAPI** | Web framework | High-performance API server with auto docs |
-| **uvicorn** | ASGI server | Runs the FastAPI app, handles HTTP connections |
-| **requests** | HTTP client | Makes REST calls to ServiceNow, Webex, Circuit LLM |
+| **FastAPI** | Web framework | High-performance async API server with auto docs |
+| **uvicorn** | ASGI server | Runs the FastAPI app |
+| **requests** | HTTP client | REST calls to ServiceNow, Webex, Circuit LLM |
 | **python-dotenv** | Config management | Loads secrets from `.env` — no hardcoded credentials |
-| **pydantic** | Data validation | Validates incoming request bodies |
-| **base64** | Encoding | Encodes credentials for Circuit LLM OAuth2 Basic Auth |
-| **json** | Serialization | Encodes Circuit LLM `appkey` metadata |
+| **threading** | Concurrency | Background thread for LLM call — keeps webhook response fast |
+| **base64** | Encoding | Encodes credentials for Circuit LLM OAuth2 Basic Auth header |
+| **json** | Serialization | Encodes Circuit LLM `appkey` metadata in `user` field |
+| **re** | Regex | Case number extraction and bot echo detection |
 | **Cisco Circuit LLM** | AI/LLM | Internal Cisco AI platform — generates case summaries |
-| **Webex Bot API** | Messaging | Sends and receives messages in Webex spaces |
-| **ServiceNow REST API** | Data source | Fetches case records and journal entries |
-| **Adaptive Cards** | UI | Interactive form cards inside Webex for case input |
+| **Webex Bot API** | Messaging | Sends/receives messages and manages cards in Webex spaces |
+| **ServiceNow REST API** | Data source | Fetches case records, journal entries, and case emails |
+| **Adaptive Cards** | UI | Interactive cards in Webex — input form, working spinner, summary display |
 | **ngrok** | Dev tunneling | Exposes local server to internet for Webex webhook testing |
 
 ---
@@ -306,29 +344,38 @@ The main FastAPI application. Handles all incoming HTTP requests from Webex, orc
 ```
 1. Engineer types "CS0001051" in Webex space
           │
-2. Webex sends POST to /webhook/webex (our FastAPI server)
+2. Webex sends POST to /webhook/webex
           │
-3. app.py extracts case number "CS0001051"
+3. app.py validates event (not bot, not thread reply)
           │
-4. servicenow_client.py calls ServiceNow API
-   → Returns: case title, state, description, sys_id
+4. app.py sends ⏳ "Generating summary…" card → returns 200 OK immediately
           │
-5. servicenow_client.py fetches journal entries (comments + work notes)
+5. Background thread starts:
           │
-6. formatter.py builds structured timeline
-   → [{ speaker: "customer", timestamp: "...", text: "..." }, ...]
+6. servicenow_client.py → GET sn_customerservice_case
+   → case title, state, description, priority, group, sys_id
           │
-7. summarizer.py builds prompt with case data + timeline
+7. servicenow_client.py → GET sys_journal_field (with fallback)
+   → comments + work_notes (chronological)
           │
-8. summarizer.py calls id.cisco.com → gets OAuth2 access token
+8. servicenow_client.py → GET sys_email
+   → emails linked to the case
           │
-9. summarizer.py calls chat-ai.cisco.com with prompt
-   → Returns: AI-generated structured summary
+9. formatter.py merges + sorts all entries into unified timeline
+   → [{ type, speaker, timestamp, text }, ...]
           │
-10. app.py sends summary back to Webex room
-    → Engineer sees: Problem Summary, Actions Taken, Status, Next Steps
+10. summarizer.py builds structured prompt
+    (case details + emails + comments + work notes sections)
           │
-11. Bot shows interactive card: "Enter next case number"
+11. summarizer.py → POST id.cisco.com → OAuth2 access token
+          │
+12. summarizer.py → POST chat-ai.cisco.com/gpt-4o-mini
+    → AI-generated structured summary (temperature=0.0)
+          │
+13. app.py PATCHes the ⏳ working card → replaced with 📋 summary card
+    Engineer sees: Issue / What happened / What was tried / Status / Next steps
+          │
+14. Engineer clicks "Summarize another case" → input card replaces summary card
 ```
 
 ---
@@ -337,31 +384,32 @@ The main FastAPI application. Handles all incoming HTTP requests from Webex, orc
 
 **Input:** Engineer types `CS0001051` in Webex
 
-**Bot Response:**
+**Bot Response (as Adaptive Card):**
 ```
+📋 Summary — CS0001051
+
 Summary for CS0001051
 
-Problem Summary:
-The customer reports that the Webex Connect desktop app fails to launch.
-No error message is displayed; the application silently exits on startup.
+Issue:
+The customer reports that WhatsApp messages are not being delivered
+since the previous day.
 
-Customer Impact:
-- Customer is unable to use the desktop application
-
-Case Context:
-- Priority: High
-- Assignment Group: CX Connect Support
-- Last Updated: 2026-03-29T02:05:25Z
-
-Key Updates:
-- Customer confirmed the issue started after the latest system update
-- Engineer checked logs and identified a missing dependency error
-
-Technical Findings:
+What happened:
+- Customer reported delivery failures for all WhatsApp messages
+- Engineer reviewed Meta API logs
 - Meta API returning error code 131047 on message delivery calls
+- Engineer escalated to platform team for investigation
 
-Current Status:
-- Case is open and under active investigation by the support engineer
+What was tried:
+- Reviewed Meta API logs and identified error code 131047
+- Escalated to platform team
+
+Current status:
+Case is open and under active investigation by the platform team.
+Error code 131047 has been identified as the root cause.
+
+Next steps:
+- Platform team to confirm fix timeline with Meta
 ```
 
 ---
@@ -371,11 +419,14 @@ Current Status:
 | Item | Approach |
 |------|----------|
 | Credentials storage | All secrets in `.env` file, never in source code |
+| `.env` committed to git | No — `.gitignore` excludes `.env` |
 | ServiceNow auth | HTTP Basic Auth over HTTPS |
-| Circuit LLM auth | OAuth2 client credentials (short-lived Bearer token) |
-| Webex bot identity | Bot email used to prevent self-triggered message loops |
+| Circuit LLM auth | OAuth2 client credentials — short-lived Bearer token fetched per call |
+| Webex bot loop prevention | `is_bot_message()` checks email domain, exact match, and known bot patterns |
+| Bot echo prevention | Additional checks for summary text patterns and card fallback phrases |
+| Thread replies | `parentId` check ensures bot ignores replies to its own messages |
 | SSL/TLS | All API calls use HTTPS |
-| `.env` file | Should be in `.gitignore` — not committed to any repository |
+| PII in summaries | LLM prompt explicitly instructs: never include email addresses or personal names |
 
 ---
 
@@ -383,25 +434,30 @@ Current Status:
 
 ### ✅ Working
 - FastAPI server with all endpoints
-- ServiceNow case + journal entry fetching
-- Timeline formatter
+- ServiceNow case record fetching
+- ServiceNow journal entries (comments + work notes) with `documentkey` fallback
+- ServiceNow case email fetching (`sys_email`)
+- Unified timeline formatter (journal + email, chronologically sorted)
 - Circuit LLM OAuth2 token fetch
-- Circuit LLM chat completions call
-- Webex message receiving and reply
-- Adaptive Card UI for case input
-- Card action handler for form submissions
-- Retry logic on all outbound HTTP calls
+- Circuit LLM chat completions with deterministic temperature
+- Webex message receiving and bot loop prevention (`is_bot_message`)
+- Adaptive Card UI: input card → working card → summary card (in-place PATCH)
+- Background thread — webhook returns `200 OK` immediately while LLM processes
+- Card actions: `summarize_case`, `open_input_card`, `exit_menu`, `close_summary`
+- Retry logic (3 attempts, exponential backoff) on all outbound HTTP calls
+- 404-safe message/action fetching (returns `None` instead of crashing)
 
 ### ⚠️ Pending Validation
-- Circuit LLM API endpoint URL — needs confirmation of correct internal URL
-- Webex webhook registration with permanent URL (requires cloud deployment)
+- Circuit LLM API key format — confirm `api-key` header vs `Authorization: Bearer` for your tenant
+- Webex webhook registration with a permanent URL (requires cloud deployment)
 
 ### 🔜 Next Steps for Production
 - Deploy to cloud (AWS / GCP / Azure / Cisco internal hosting) for permanent webhook URL
-- Add Webex webhook secret validation (HMAC signature check)
-- Add structured logging to file
-- Add token caching with expiry refresh for Circuit LLM
-- Add unit tests
+- Add Webex webhook secret validation (HMAC signature check on incoming payloads)
+- Cache Circuit LLM OAuth2 token with expiry refresh (avoid token fetch on every call)
+- Add structured logging to file (rotate daily)
+- Add unit tests for formatter, summarizer, and bot-ignore logic
+- Add rate limiting per user/room to prevent abuse
 
 ---
 
@@ -411,27 +467,29 @@ Current Status:
 # 1. Clone / open the project
 cd /path/to/summary-agent
 
-# 2. Activate virtual environment
+# 2. Create and activate virtual environment
+python3 -m venv .venv
 source .venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Start the server
+# 4. Create .env file and fill in credentials
+# (See config.py for all required variables)
+
+# 5. Start the FastAPI server
 uvicorn app:app --reload
 # Server runs at http://127.0.0.1:8000
 
-# 5. Expose via ngrok (for Webex webhook)
+# 6. Expose via ngrok (for Webex webhook)
 ngrok http 8000
-# Register https://<ngrok-url>/webhook/webex in Webex Developer Portal
+# Register the following URLs in Webex Developer Portal:
+#   https://<ngrok-url>/webhook/webex         ← for messages
+#   https://<ngrok-url>/webhook/webex/card-action ← for card submissions
 
-# 6. Test health
-curl http://127.0.0.1:8000/health
-
-# 7. Test case summary
-curl -X POST http://127.0.0.1:8000/summary/by-case-number \
-  -H "Content-Type: application/json" \
-  -d '{"case_number": "CS0001051"}'
+# 7. Verify the bot is running
+curl http://127.0.0.1:8000/
+curl http://127.0.0.1:8000/debug-env
 ```
 
 ---
@@ -445,4 +503,4 @@ requests
 python-dotenv
 ```
 
-All other modules used (`base64`, `json`, `re`, `os`, `time`, `typing`) are part of Python's standard library — no additional installation required.
+All other modules used (`base64`, `json`, `re`, `os`, `time`, `threading`, `typing`) are part of Python's standard library — no additional installation required.
