@@ -44,10 +44,11 @@ summary-agent/
 ├── .dockerignore         # Files excluded from Docker build
 ├── requirements.txt      # Dependencies
 ├── .env                  # Secrets (not committed)
-├── LAMBDA_DEPLOY.md      # AWS Lambda deployment guide
-├── POC_OVERVIEW.md       # Full architecture & code walkthrough
-├── TOOLS_EXPLAINED.md    # Every tool/library explained
-└── TEAM_MEETING.md       # Team presentation notes
+└── docs/
+    ├── POC_OVERVIEW.md   # Full architecture & code walkthrough
+    ├── TOOLS_EXPLAINED.md# Every tool/library explained
+    ├── LAMBDA_DEPLOY.md  # AWS Lambda deployment guide
+    └── DEMO_FLOW.md      # Live demo walkthrough guide
 ```
 
 ---
@@ -108,7 +109,7 @@ docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
 # Then: Create Lambda from ECR image → attach API Gateway → register Webex webhooks
 ```
 
-See **[LAMBDA_DEPLOY.md](LAMBDA_DEPLOY.md)** for the full step-by-step deployment guide.
+See **[LAMBDA_DEPLOY.md](docs/LAMBDA_DEPLOY.md)** for the full step-by-step deployment guide.
 
 ---
 

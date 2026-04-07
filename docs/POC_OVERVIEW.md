@@ -114,10 +114,11 @@ summary-agent/
 ├── .dockerignore           # Files excluded from Docker build context
 ├── requirements.txt        # Python package dependencies
 ├── .env                    # Configuration & secrets (gitignored, not committed)
-├── LAMBDA_DEPLOY.md        # Step-by-step AWS Lambda deployment guide
-├── POC_OVERVIEW.md         # This file — full architecture & code walkthrough
-├── TOOLS_EXPLAINED.md      # Every tool and library explained
-└── TEAM_MEETING.md         # Team presentation notes
+└── docs/
+    ├── POC_OVERVIEW.md     # This file — full architecture & code walkthrough
+    ├── TOOLS_EXPLAINED.md  # Every tool and library explained
+    ├── LAMBDA_DEPLOY.md    # Step-by-step AWS Lambda deployment guide
+    └── DEMO_FLOW.md        # Live demo walkthrough guide
 ```
 
 ---
@@ -601,7 +602,7 @@ docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
 #    - targetUrl: https://<api-gateway-url>/webhook/webex/card-action
 ```
 
-See **[LAMBDA_DEPLOY.md](LAMBDA_DEPLOY.md)** for the full step-by-step deployment guide.
+See **[LAMBDA_DEPLOY.md](./LAMBDA_DEPLOY.md)** for the full step-by-step deployment guide.
 
 ---
 
