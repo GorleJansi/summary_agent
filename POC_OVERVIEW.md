@@ -45,8 +45,14 @@ The engineer never leaves Webex. The entire interaction takes 3–5 seconds. The
                      │  Webex Webhook (HTTPS POST)
                      ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   FASTAPI APPLICATION                        │
-│                    (app.py — port 8000)                     │
+│               AWS API GATEWAY (HTTPS)                       │
+│         Permanent public URL for Webex webhooks             │
+└────────────────────┬────────────────────────────────────────┘
+                     │  Lambda event (JSON)
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│              AWS LAMBDA + MANGUM                             │
+│         (lambda_handler.py → Mangum → FastAPI)              │
 │                                                             │
 │  POST /webhook/webex            ← Receives Webex messages   │
 │  POST /webhook/webex/card-action← Handles card submissions  │
@@ -103,8 +109,15 @@ summary-agent/
 ├── formatter.py            # Merges journal entries + emails into sorted timeline
 ├── servicenow_client.py    # ServiceNow REST API — case, journal, email fetching
 ├── summarizer.py           # Circuit LLM OAuth2 + prompt builder + AI call
+├── lambda_handler.py       # AWS Lambda entry point (Mangum — wraps FastAPI)
+├── Dockerfile              # Docker image for AWS Lambda deployment
+├── .dockerignore           # Files excluded from Docker build context
 ├── requirements.txt        # Python package dependencies
-└── .env                    # Configuration & secrets (gitignored, not committed)
+├── .env                    # Configuration & secrets (gitignored, not committed)
+├── LAMBDA_DEPLOY.md        # Step-by-step AWS Lambda deployment guide
+├── POC_OVERVIEW.md         # This file — full architecture & code walkthrough
+├── TOOLS_EXPLAINED.md      # Every tool and library explained
+└── TEAM_MEETING.md         # Team presentation notes
 ```
 
 ---
@@ -276,14 +289,32 @@ This is robust even if the env var is wrong or missing.
 | `send_card(room_id, card, fallback_text)` | Sends a new card message, returns `message_id` |
 | `replace_card(message_id, card, fallback_text)` | PATCHes an existing card in-place |
 | `send_text(room_id, text)` | Sends a plain text message |
-| `_input_card(title, subtitle)` | Builds the input form card (text field + Summarize + Cancel) |
+| `_welcome_card(user_email)` | Builds the 👋 welcome card (shown once per room on first contact) with "Get Started" button |
+| `_input_card(title, subtitle)` | Builds the 🔍 input form card (text field + Summarize + Cancel) |
 | `_working_card(case_number)` | Builds the ⏳ spinner card shown while LLM processes |
 | `_summary_card(case_number, summary_text)` | Builds the 📋 result card (truncated to 2000 chars) with "Summarize another" + "Close" buttons |
+
+**Welcome Flow — `_maybe_send_welcome(room_id, user_email)`**
+- Tracks rooms in an in-memory `welcomed_rooms` set
+- Sends the welcome card **once** per room per server session
+- On server restart the set resets — users get a re-welcome (harmless)
+- Greets user by name (extracted from email local part, e.g. "jgorle")
 
 **Background Thread — `_summarize_and_flip(room_id, case_number, card_message_id)`**
 - Runs the full `get_summary()` pipeline in a daemon thread so the webhook returns `200 OK` immediately
 - When summary is ready, calls `replace_card()` to PATCH the ⏳ working card with the 📋 summary card
 - If no `card_message_id` (edge case), sends a new card instead
+
+**Webex Webhook Registration:**
+
+Two webhooks must be registered with the Webex API pointing to your deployment URL:
+
+| Webhook Name | Resource | Event | Target Endpoint |
+|-------------|----------|-------|-----------------|
+| `summary-agent-messages` | `messages` | `created` | `/webhook/webex` |
+| `summary-agent-card-actions` | `attachmentActions` | `created` | `/webhook/webex/card-action` |
+
+The bot uses an **org-wide webhook** — it receives events for all DMs in the org, but can only read/reply in rooms where it is already a member. Users must open a direct message with the bot to start using it.
 
 **Webhook Message Flow (`/webhook/webex`):**
 
@@ -292,28 +323,67 @@ This is robust even if the env var is wrong or missing.
 2. Ignore if missing message_id or room_id
 3. Ignore if is_bot_message(person_email) — outer payload check
 4. Ignore if parentId present — thread replies are skipped
-5. Fetch full message from Webex API
+5. Fetch full message from Webex API (returns None/404 if bot not in room)
 6. Ignore if is_bot_message(fetched_email) — fetched message check
 7. Ignore if text matches "Summary for CS..." — bot summary echo guard
-8. Ignore if text is a known bot card fallback phrase
-9. If "exit/quit/close" → send goodbye text
-10. If text is exactly a case number → send ⏳ card → start background thread
-11. If text starts with "summarize" + has case number → send ⏳ card → start background thread
-12. Otherwise → show 🔍 input card
+8. Ignore if text is a known bot card fallback phrase (BOT_FALLBACK_PHRASES set)
+9. Route message:
+   a. Send 👋 welcome card if first contact in this room (one-time per session)
+   b. If "exit/quit/close" → send goodbye text
+   c. If text is exactly a case number (e.g. CS0001051) → send ⏳ card → background thread
+   d. If text starts with "summarize" + has case number → send ⏳ card → background thread
+   e. Otherwise → show 🔍 input card
 ```
 
 **Card Action Flow (`/webhook/webex/card-action`):**
 
 ```
 1. Receive card submission → extract action_id, room_id, person_email, card_message_id
-2. Ignore if is_bot_message(person_email)
-3. Fetch action details from Webex API
-4. action = "open_input_card" → replace/send input card
-5. action = "exit_menu"       → send goodbye text
-6. action = "close_summary"   → replace/send input card
-7. action = "summarize_case"  → validate case number
+2. Ignore if missing action_id or room_id
+3. Ignore if is_bot_message(person_email)
+4. Fetch action details from Webex API (returns inputs + action name)
+5. action = "open_input_card" → replace/send input card (from welcome or summary card)
+6. action = "exit_menu"       → send goodbye text ("Closed ✅")
+7. action = "close_summary"   → replace/send input card
+8. action = "summarize_case"  → validate case number
    → valid:   replace card with ⏳ working card → start background thread
-   → invalid: replace/send input card with error subtitle
+   → invalid: replace/send input card with ⚠️ error subtitle
+9. Unknown action → log and ignore
+```
+
+---
+
+### Layer 6 — AWS Lambda Deployment (`lambda_handler.py` + `Dockerfile`)
+
+**What it does:**
+Packages the entire FastAPI application into a Docker container image that runs as an AWS Lambda function behind API Gateway, providing a permanent public HTTPS endpoint for Webex webhooks.
+
+**Why Lambda instead of ngrok?**
+- ngrok is **blocked on the Cisco corporate network**
+- ngrok URLs change every restart — Lambda provides a **permanent URL**
+- Lambda is **always available** (no need to keep a laptop open)
+- Lambda **auto-scales** and costs near-zero for this use case
+
+**Lambda Handler (`lambda_handler.py`):**
+```python
+from mangum import Mangum
+from app import app
+handler = Mangum(app, lifespan="off")
+```
+
+Mangum converts API Gateway events into ASGI requests that FastAPI understands. The `handler` function is what Lambda invokes for every incoming HTTP request.
+
+**Docker Image:**
+- Base: `public.ecr.aws/lambda/python:3.13` (AWS official Lambda runtime)
+- Installs all dependencies from `requirements.txt`
+- Copies all `.py` source files
+- Entry point: `lambda_handler.handler`
+- Image size: ~191 MB
+
+**Deployment Flow:**
+```
+Docker build → Push to ECR → Create Lambda from image
+  → Attach API Gateway → Register Webex webhooks
 ```
 
 ---
@@ -324,9 +394,14 @@ This is robust even if the env var is wrong or missing.
 |-----------|----------|----------|
 | **Python 3.13** | Language | Core development language |
 | **FastAPI** | Web framework | High-performance async API server with auto docs |
-| **uvicorn** | ASGI server | Runs the FastAPI app |
+| **uvicorn** | ASGI server | Runs the FastAPI app locally during development |
+| **Mangum** | Lambda adapter | Converts API Gateway events ↔ ASGI requests for Lambda |
+| **Docker** | Containerization | Packages app into AWS Lambda container image |
+| **AWS Lambda** | Serverless compute | Runs the app in the cloud — always available, auto-scaling |
+| **AWS API Gateway** | HTTPS endpoint | Permanent public URL for Webex webhooks |
 | **requests** | HTTP client | REST calls to ServiceNow, Webex, Circuit LLM |
 | **python-dotenv** | Config management | Loads secrets from `.env` — no hardcoded credentials |
+| **pydantic** | Validation | Validates incoming request data |
 | **threading** | Concurrency | Background thread for LLM call — keeps webhook response fast |
 | **base64** | Encoding | Encodes credentials for Circuit LLM OAuth2 Basic Auth header |
 | **json** | Serialization | Encodes Circuit LLM `appkey` metadata in `user` field |
@@ -335,7 +410,7 @@ This is robust even if the env var is wrong or missing.
 | **Webex Bot API** | Messaging | Sends/receives messages and manages cards in Webex spaces |
 | **ServiceNow REST API** | Data source | Fetches case records, journal entries, and case emails |
 | **Adaptive Cards** | UI | Interactive cards in Webex — input form, working spinner, summary display |
-| **ngrok** | Dev tunneling | Exposes local server to internet for Webex webhook testing |
+| **ngrok** | Dev tunneling | ❌ Replaced by AWS Lambda — was blocked on Cisco corporate network |
 
 ---
 
@@ -344,7 +419,7 @@ This is robust even if the env var is wrong or missing.
 ```
 1. Engineer types "CS0001051" in Webex space
           │
-2. Webex sends POST to /webhook/webex
+2. Webex sends POST → API Gateway → Lambda → /webhook/webex
           │
 3. app.py validates event (not bot, not thread reply)
           │
@@ -446,13 +521,18 @@ Next steps:
 - Card actions: `summarize_case`, `open_input_card`, `exit_menu`, `close_summary`
 - Retry logic (3 attempts, exponential backoff) on all outbound HTTP calls
 - 404-safe message/action fetching (returns `None` instead of crashing)
+- Docker image built and tested locally (GET / → 200 OK)
+- Lambda handler with Mangum wrapping FastAPI
+- Code pushed to GitHub: [GorleJansi/summary_agent](https://github.com/GorleJansi/summary_agent)
 
-### ⚠️ Pending Validation
-- Circuit LLM API key format — confirm `api-key` header vs `Authorization: Bearer` for your tenant
-- Webex webhook registration with a permanent URL (requires cloud deployment)
+### ⏳ Pending (Awaiting AWS Access)
+- Push Docker image to AWS ECR
+- Create Lambda function from ECR image
+- Attach API Gateway for permanent HTTPS URL
+- Set Lambda environment variables (all `.env` values)
+- Register Webex webhooks with API Gateway URL
 
-### 🔜 Next Steps for Production
-- Deploy to cloud (AWS / GCP / Azure / Cisco internal hosting) for permanent webhook URL
+### 🔜 Future Enhancements
 - Add Webex webhook secret validation (HMAC signature check on incoming payloads)
 - Cache Circuit LLM OAuth2 token with expiry refresh (avoid token fetch on every call)
 - Add structured logging to file (rotate daily)
@@ -461,11 +541,14 @@ Next steps:
 
 ---
 
-## 12. How to Run Locally
+## 12. How to Run
+
+### Option A — Local Development
 
 ```bash
-# 1. Clone / open the project
-cd /path/to/summary-agent
+# 1. Clone the repo
+git clone https://github.com/GorleJansi/summary_agent.git
+cd summary_agent
 
 # 2. Create and activate virtual environment
 python3 -m venv .venv
@@ -481,16 +564,44 @@ pip install -r requirements.txt
 uvicorn app:app --reload
 # Server runs at http://127.0.0.1:8000
 
-# 6. Expose via ngrok (for Webex webhook)
-ngrok http 8000
-# Register the following URLs in Webex Developer Portal:
-#   https://<ngrok-url>/webhook/webex         ← for messages
-#   https://<ngrok-url>/webhook/webex/card-action ← for card submissions
-
-# 7. Verify the bot is running
+# 6. Verify the bot is running
 curl http://127.0.0.1:8000/
 curl http://127.0.0.1:8000/debug-env
 ```
+
+### Option B — Docker (Local Lambda Simulation)
+
+```bash
+# 1. Build the Docker image
+docker build -t summary-agent:latest .
+
+# 2. Run locally (simulates Lambda)
+docker run --rm -p 9000:8080 --env-file .env summary-agent:latest
+
+# 3. Test
+curl http://localhost:9000/2015-03-31/functions/function/invocations \
+  -d '{"httpMethod":"GET","path":"/"}'
+```
+
+### Option C — AWS Lambda (Production)
+
+```bash
+# 1. Push image to ECR
+aws ecr get-login-password --region <REGION> | \
+  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+docker tag summary-agent:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
+
+# 2. Create Lambda from ECR image (via Console or CLI)
+# 3. Attach API Gateway (HTTP API)
+# 4. Set environment variables on Lambda
+# 5. Register Webex webhooks:
+#    POST https://webexapis.com/v1/webhooks
+#    - targetUrl: https://<api-gateway-url>/webhook/webex
+#    - targetUrl: https://<api-gateway-url>/webhook/webex/card-action
+```
+
+See **[LAMBDA_DEPLOY.md](LAMBDA_DEPLOY.md)** for the full step-by-step deployment guide.
 
 ---
 
@@ -501,6 +612,16 @@ fastapi
 uvicorn
 requests
 python-dotenv
+pydantic
+mangum
 ```
 
 All other modules used (`base64`, `json`, `re`, `os`, `time`, `threading`, `typing`) are part of Python's standard library — no additional installation required.
+
+---
+
+## 14. Repository
+
+**GitHub:** [https://github.com/GorleJansi/summary_agent](https://github.com/GorleJansi/summary_agent)
+
+**Author:** Jansi Gorle — jgorle@cisco.com

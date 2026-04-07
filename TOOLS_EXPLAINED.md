@@ -105,39 +105,39 @@ App fetches ServiceNow case → sends reply to Webex
 ### Limitation
 - The free ngrok URL **changes every time** you restart ngrok
 - You must update the Webex webhook URL each time
-- Fix: Use a paid ngrok plan with a static domain, OR deploy to cloud
+- ngrok is **blocked on Cisco corporate network**
 
 ### In production
-ngrok is **not used in production**. Once deployed to a cloud server (AWS, GCP, Azure, Railway, etc.), the server has a permanent public IP/domain and ngrok is no longer needed.
+ngrok is **not used in production** and was only used in early development. This project now uses **AWS Lambda + API Gateway** for a permanent public HTTPS endpoint — no tunnel needed. See the [Mangum](#mangum) and [Docker / AWS Lambda](#docker--aws-lambda) sections below.
 
 ---
 
 ## Side-by-Side Comparison
 
-| | uvicorn | ngrok |
-|---|---------|-------|
-| **What it does** | Runs your Python web server | Creates a public tunnel to your laptop |
-| **Where it runs** | On your machine | On your machine + ngrok's cloud |
-| **Port** | 8000 (local only) | Creates public HTTPS URL |
-| **Required in production?** | ✅ Yes | ❌ No |
-| **Required in development?** | ✅ Yes | ✅ Yes (for Webex webhooks) |
-| **Start command** | `uvicorn app:app --reload` | `ngrok http 8000` |
+| | uvicorn | ngrok | Mangum + Lambda |
+|---|---------|-------|------------------|
+| **What it does** | Runs your Python web server locally | Creates a public tunnel to your laptop | Runs your FastAPI app inside AWS Lambda |
+| **Where it runs** | On your machine | On your machine + ngrok's cloud | AWS cloud |
+| **Port** | 8000 (local only) | Creates public HTTPS URL | API Gateway provides permanent HTTPS URL |
+| **Required in production?** | ❌ No (Lambda replaces it) | ❌ No | ✅ Yes |
+| **Required in development?** | ✅ Yes | Optional (blocked on Cisco network) | ❌ No |
+| **Start command** | `uvicorn app:app --reload` | `ngrok http 8000` | Deployed via Docker image to AWS |
 
 ---
 
-## Full Local Dev Setup (both tools together)
+## Full Local Dev Setup
 
-```
-Terminal 1                          Terminal 2
-──────────────────────────────      ──────────────────────────────
-$ uvicorn app:app --reload          $ ngrok http 8000
+```bash
+# Just start the server — no ngrok needed if using Lambda in production
+uvicorn app:app --reload
 
-INFO: Uvicorn running on            Forwarding:
-      http://127.0.0.1:8000         https://abc123.ngrok-free.app
-                                          -> http://127.0.0.1:8000
+# Server runs at http://127.0.0.1:8000
+# Test: curl http://127.0.0.1:8000/
 ```
 
-Register `https://abc123.ngrok-free.app/webhook/webex` as the Webex Bot webhook URL, and the full flow works end-to-end from your laptop.
+For **production**, the app runs as an AWS Lambda function behind API Gateway. Register the API Gateway URL as the Webex Bot webhook:
+- `https://<api-gateway-url>/webhook/webex` — for messages
+- `https://<api-gateway-url>/webhook/webex/card-action` — for card submissions
 
 ---
 
@@ -158,9 +158,9 @@ Register `https://abc123.ngrok-free.app/webhook/webex` as the Webex Bot webhook 
 from fastapi import FastAPI
 app = FastAPI()
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+@app.get("/")
+def root():
+    return {"message": "ServiceNow + Webex case-summary bot is running ✅"}
 ```
 
 ### Analogy
@@ -174,9 +174,10 @@ def health():
 **requests** is a Python library for making **HTTP calls** to external APIs.
 
 ### Why do we use it?
-We use it to talk to two external services:
-1. **ServiceNow REST API** — fetch case details and journal entries
-2. **Webex API** — fetch message content and send replies back to Webex rooms
+We use it to talk to three external services:
+1. **ServiceNow REST API** — fetch case details, journal entries, and case emails
+2. **Webex API** — fetch message content, send replies, send/replace Adaptive Cards
+3. **Cisco Circuit LLM** — fetch OAuth2 access token and call the chat completions endpoint
 
 ### How we use it
 
@@ -204,11 +205,15 @@ We store secrets (passwords, API keys, tokens) in a `.env` file so they are:
 
 ### Our `.env` file
 ```
-SN_INSTANCE=https://dev181123.service-now.com
-SN_USERNAME=admin
-SN_PASSWORD=bmXMd!/WF06y
-OPENAI_API_KEY=sk-proj-...
+SERVICENOW_INSTANCE=https://dev181123.service-now.com
+SERVICENOW_USERNAME=admin
+SERVICENOW_PASSWORD=...
 WEBEX_BOT_TOKEN=...
+WEBEX_BOT_EMAIL=jansi-test@webex.bot
+CIRCUIT_CLIENT_ID=...
+CIRCUIT_CLIENT_SECRET=...
+CIRCUIT_APP_KEY=...
+CIRCUIT_MODEL=gpt-4o-mini
 ```
 
 ### How we use it
@@ -217,7 +222,7 @@ WEBEX_BOT_TOKEN=...
 from dotenv import load_dotenv
 import os
 load_dotenv()
-password = os.getenv("SN_PASSWORD")
+password = os.getenv("SERVICENOW_PASSWORD")
 ```
 
 ### Analogy
@@ -225,129 +230,151 @@ password = os.getenv("SN_PASSWORD")
 
 ---
 
-## OpenAI (openai SDK)
+## Mangum
 
 ### What is it?
-The **OpenAI Python SDK** lets you call OpenAI's GPT models (like `gpt-4o-mini`) from Python code.
+**Mangum** is a Python library that wraps ASGI applications (like FastAPI) so they can run inside **AWS Lambda**.
 
-### Why do we use it?
-Instead of writing a manual rule-based summary, we send the case timeline to GPT and get back a human-readable, intelligent summary with:
-- Problem Summary
-- Actions Taken
-- Current Status
-- Next Steps
+### Why do we need it?
+AWS Lambda expects a specific handler function that receives an event and returns a response. FastAPI is an ASGI web framework that expects HTTP requests. Mangum bridges this gap — it converts API Gateway events into ASGI requests that FastAPI understands, and converts FastAPI's responses back into the format Lambda expects.
 
 ### How we use it
 
 ```python
-from openai import OpenAI
-client = OpenAI(api_key="sk-proj-...")
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": prompt}]
-)
-print(response.choices[0].message.content)
+# lambda_handler.py
+from mangum import Mangum
+from app import app
+
+handler = Mangum(app, lifespan="off")
 ```
 
-### Current status
-⚠️ Blocked by `429 insufficient_quota` — OpenAI account needs billing credits at https://platform.openai.com/settings/billing
+| Part | Meaning |
+|------|--------|
+| `app` | The FastAPI instance from `app.py` |
+| `lifespan="off"` | Disables startup/shutdown events (not needed in Lambda) |
+| `handler` | The function AWS Lambda calls for every request |
+
+### How it works
+
+```
+User sends message in Webex
+     │
+     ▼
+Webex webhook → API Gateway receives HTTPS POST
+     │
+     ▼
+API Gateway translates to Lambda event JSON
+     │
+     ▼
+Lambda invokes handler() (Mangum)
+     │
+     ▼
+Mangum converts event → ASGI request → FastAPI handles it
+     │
+     ▼
+FastAPI response → Mangum converts back → API Gateway → HTTPS response
+```
 
 ### Analogy
-> OpenAI is the **intelligent analyst** who reads the case and writes a proper summary for you.
+> Mangum is the **interpreter** between AWS Lambda (speaks event JSON) and FastAPI (speaks HTTP). Neither can understand each other without it.
 
 ---
 
-## httpx
+## Docker / AWS Lambda
 
-### What is it?
-**httpx** is a modern Python HTTP client — similar to `requests` but supports both sync and async, and allows custom SSL configuration.
+### What is Docker?
+**Docker** packages your application and all its dependencies into a single **container image** that runs identically everywhere.
 
-### Why do we use it?
-The OpenAI SDK uses `httpx` internally for all API calls. We also use it directly to pass a **custom SSL certificate bundle** so that OpenAI API calls work through the **Cisco Umbrella corporate proxy**.
+### Why do we use Docker?
+AWS Lambda supports deploying functions as Docker container images. We package our entire FastAPI app into a Docker image based on AWS's official Python 3.13 Lambda base image.
 
-### How we use it
+### Our Dockerfile
 
-```python
-import httpx
-http_client = httpx.Client(verify="/tmp/macos-combined-certs.pem")
-client = OpenAI(api_key="...", http_client=http_client)
+```dockerfile
+FROM public.ecr.aws/lambda/python:3.13
+
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+COPY app.py config.py formatter.py servicenow_client.py \
+     summarizer.py lambda_handler.py ${LAMBDA_TASK_ROOT}/
+
+CMD ["lambda_handler.handler"]
 ```
 
+| Part | Meaning |
+|------|--------|
+| `FROM public.ecr.aws/lambda/python:3.13` | AWS-optimized Python 3.13 base image for Lambda |
+| `LAMBDA_TASK_ROOT` | The directory Lambda looks in for your code (`/var/task`) |
+| `CMD ["lambda_handler.handler"]` | Tells Lambda to call `handler()` in `lambda_handler.py` |
+
+### Build & test locally
+
+```bash
+# Build the image
+docker build -t summary-agent:latest .
+
+# Test locally (simulates Lambda runtime)
+docker run --rm -p 9000:8080 --env-file .env summary-agent:latest
+
+# Send a test request
+curl http://localhost:9000/2015-03-31/functions/function/invocations \
+  -d '{"httpMethod":"GET","path":"/"}'
+```
+
+### Deploy to AWS
+
+```bash
+# 1. Push to ECR (Elastic Container Registry)
+aws ecr get-login-password --region <REGION> | \
+  docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+
+docker tag summary-agent:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/summary-agent:latest
+
+# 2. Create Lambda function from ECR image
+# 3. Attach API Gateway (HTTP API) for public HTTPS URL
+# 4. Register Webex webhooks pointing to the API Gateway URL
+```
+
+### Why Lambda instead of ngrok?
+
+| | ngrok | AWS Lambda |
+|---|-------|------------|
+| **URL** | Changes every restart | Permanent API Gateway URL |
+| **Cost** | Free tier limited | Pay per request (very cheap) |
+| **Corporate network** | Blocked by Cisco | Works everywhere |
+| **Uptime** | Only while laptop is open | Always available |
+| **Scaling** | Single laptop | Auto-scales to thousands of requests |
+
 ### Analogy
-> `httpx` is the **secure courier** that carries data to OpenAI, with the correct corporate ID badge (SSL cert) to pass through the firewall.
-
----
-
-## certifi
-
-### What is it?
-**certifi** is a Python package that provides an up-to-date bundle of **SSL root certificates**.
-
-### Why do we use it?
-Python on macOS doesn't automatically trust all SSL certificates, especially those from corporate proxies like Cisco Umbrella. `certifi` provides a base certificate bundle.
-
-### Note
-In our case, even `certifi` alone wasn't enough because the Cisco Umbrella proxy uses its own certificate. We had to export the full **macOS system keychain** certs and use those instead (handled automatically in `summarizer.py`).
+> Docker is the **shipping container** — everything the app needs is packed inside. AWS Lambda is the **warehouse** — it stores and runs the container whenever a request arrives, and you only pay for the seconds it's running.
 
 ---
 
 ## pydantic
 
 ### What is it?
-**pydantic** is a Python data validation library. FastAPI uses it to validate incoming request bodies.
+**pydantic** is a Python data validation library. FastAPI uses it internally to validate incoming request bodies and serialize responses.
 
 ### Why do we use it?
-When the `/summary/by-case-number` endpoint receives a POST request, pydantic ensures the body has the correct fields and types — and returns a clear error if not.
+FastAPI depends on pydantic for all JSON parsing and response serialization. When our webhook endpoints (`/webhook/webex`, `/webhook/webex/card-action`) receive POST requests, pydantic ensures the JSON bodies are valid — and returns a clear `422 Unprocessable Entity` error if not.
 
 ### How we use it
 
+FastAPI uses pydantic behind the scenes automatically. Every `return {"status": "ok"}` from a route is validated and serialized by pydantic.
+
 ```python
-from pydantic import BaseModel
-
-class CaseSummaryRequest(BaseModel):
-    case_number: str
+# FastAPI + pydantic validate the request and response automatically
+@app.post("/webhook/webex")
+async def webex_webhook(request: Request):
+    body = await request.json()  # pydantic validates JSON structure
+    ...
+    return {"status": "ok"}     # pydantic serializes the response
 ```
-
-If someone sends `{"case_number": 123}` (int instead of string) — pydantic automatically rejects it with a `422 Unprocessable Entity` error.
 
 ### Analogy
-> Pydantic is the **security guard** at the API door — checks your request has the right format before letting it in.
-
----
-
-## ssl + socket (Python standard library)
-
-### What are they?
-Built-in Python modules for working with **SSL/TLS encryption** and **network connections**.
-
-### Why do we use them?
-We used them to **diagnose** the SSL issue — specifically to inspect which certificate was being presented by the server when connecting to `api.openai.com`. This revealed the Cisco Umbrella proxy was intercepting the connection.
-
-```python
-import ssl, socket
-ctx = ssl.create_default_context()
-with socket.create_connection(('api.openai.com', 443)) as sock:
-    with ctx.wrap_socket(sock, server_hostname='api.openai.com') as ssock:
-        print(ssock.getpeercert()['issuer'])
-# Output: Cisco Secure Access SubCA — confirmed proxy interception
-```
-
----
-
-## subprocess (Python standard library)
-
-### What is it?
-Built-in Python module to **run shell commands** from within Python code.
-
-### Why do we use it?
-In `summarizer.py`, we run `security export` shell commands at startup to export the macOS system keychain SSL certificates into a `.pem` file — so the OpenAI client can trust the Cisco Umbrella proxy certificate.
-
-```python
-import subprocess
-subprocess.run("security export -t certs -f pemseq -k /Library/Keychains/System.keychain -o /tmp/_sys.pem", shell=True)
-```
-
----
+> Pydantic is the **security guard** at the API door — checks every request and response has the right format.
 
 ---
 
@@ -448,15 +475,18 @@ Body: {
 
 ## All Tools — Quick Reference
 
-| Tool | Type | Purpose |
-|------|------|---------|
-| **uvicorn** | Server | Runs the FastAPI app on port 8000 |
-| **ngrok** | Tunnel | Gives local server a public HTTPS URL |
-| **FastAPI** | Web framework | Defines API routes and handles requests |
-| **requests** | HTTP client | Calls ServiceNow, Webex, and Circuit LLM APIs |
-| **python-dotenv** | Config loader | Loads secrets from `.env` file |
-| **pydantic** | Validation | Validates incoming API request data |
-| **ssl + socket** | Diagnostics | Used to inspect SSL certificates |
-| **base64** | Encoding | Encodes credentials for Circuit LLM Basic Auth |
-| **json** | Serialization | Encodes `appkey` payload for Circuit LLM |
-| **Cisco Circuit LLM** | AI backend | Internal Cisco LLM — generates case summaries |
+| Tool | Type | Purpose | Required in Prod? |
+|------|------|---------|-------------------|
+| **FastAPI** | Web framework | Defines API routes and handles requests | ✅ |
+| **uvicorn** | ASGI server | Runs the FastAPI app locally on port 8000 | ❌ (Lambda replaces it) |
+| **Mangum** | Lambda adapter | Converts API Gateway events ↔ ASGI requests | ✅ |
+| **Docker** | Containerization | Packages app into AWS Lambda container image | ✅ (for deployment) |
+| **AWS Lambda** | Serverless compute | Runs the app in the cloud, always available | ✅ |
+| **API Gateway** | HTTPS endpoint | Permanent public URL for Webex webhooks | ✅ |
+| **requests** | HTTP client | Calls ServiceNow, Webex, and Circuit LLM APIs | ✅ |
+| **python-dotenv** | Config loader | Loads secrets from `.env` file | ✅ |
+| **pydantic** | Validation | Validates incoming API request data | ✅ |
+| **base64** | Encoding | Encodes credentials for Circuit LLM Basic Auth | ✅ |
+| **json** | Serialization | Encodes `appkey` payload for Circuit LLM | ✅ |
+| **Cisco Circuit LLM** | AI backend | Internal Cisco LLM — generates case summaries | ✅ |
+| **ngrok** | Tunnel | Gives local server a public HTTPS URL | ❌ (replaced by Lambda) |
